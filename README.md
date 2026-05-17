@@ -35,6 +35,10 @@ GEMINI_API_KEY=your_gemini_key
 OLLAMA_BASE_URL=http://localhost:11434
 ```
 
+## System Architecture
+
+![System Architecture](./system-design-highlevel.png)
+
 ## Project Structure
 
 ```text
