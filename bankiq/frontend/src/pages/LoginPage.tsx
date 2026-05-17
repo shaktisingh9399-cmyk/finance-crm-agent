@@ -108,7 +108,6 @@ export function LoginPage() {
               Username: <code className="rounded bg-white px-1">rm_demo</code> · Password:{" "}
               <code className="rounded bg-white px-1">demo1234</code>
             </p>
-            <p className="mt-1 text-slate-500">Run <code>python manage.py seed_demo</code> first.</p>
           </div>
         </form>
       </div>

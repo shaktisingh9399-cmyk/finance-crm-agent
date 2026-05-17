@@ -72,11 +72,10 @@ export function ConversationPanel({
             className={`flex ${msg.role === AgentMessageRole.User ? "justify-end" : "justify-start"}`}
           >
             <div
-              className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm leading-relaxed ${
-                msg.role === AgentMessageRole.User
-                  ? "bg-bank-navy text-white"
-                  : "border border-slate-200 bg-slate-50 text-slate-800"
-              }`}
+              className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm leading-relaxed ${msg.role === AgentMessageRole.User
+                ? "bg-bank-navy text-white"
+                : "border border-slate-200 bg-slate-50 text-slate-800"
+                }`}
             >
               {msg.role === AgentMessageRole.User && (
                 <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-bank-gold/90">
@@ -101,7 +100,7 @@ export function ConversationPanel({
             <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-600">
               <span className="inline-flex items-center gap-2">
                 <span className="h-2 w-2 animate-pulse rounded-full bg-bank-gold" />
-                Analysing your portfolio…
+                Reviewing your portfolio for high-value customers...
               </span>
             </div>
           </div>

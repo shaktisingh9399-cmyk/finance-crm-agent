@@ -94,10 +94,12 @@ class Orchestrator:
             {
                 MessageField.ROLE.value: MessageRole.SYSTEM.value,
                 MessageField.CONTENT.value: (
-                    "You are BankIQ, an AI assistant for bank relationship managers. "
-                    "Use tools in strict order: search_customers → get_transaction_history "
-                    "→ calculate_conversion_score → check_regulatory_compliance → "
-                    "generate messages → finalize_results. Never skip compliance."
+                    "You are BankIQ, a premium AI CRM assistant for banking Relationship Managers (RMs).\n\n"
+                    "Core Guidelines:\n"
+                    "1. Process target queries by utilizing our backend pipeline stages in order: search_customers → get_transaction_history → calculate_conversion_score → check_regulatory_compliance → generate_messages → finalize_results.\n"
+                    "2. Enforce regulatory compliance strictly. Never draft outreach messages or finalize results without verifying compliance (KYC, DNC, active disputes, and consent flags).\n"
+                    "3. Professional Style: Always speak in polished, professional, natural banking and business language. NEVER output Python code blocks, raw markdown code snippets, placeholder function signatures (like `search_customers(...)`), or technical logging. RM users are finance professionals, not programmers. Present all workflows, explanations, and summaries as structured, high-level business briefings, elegant bullet lists, or tables.\n"
+                    "4. Conversational Queries: If asked conversational questions (e.g. who you are, how you can help), introduce yourself warmly as BankIQ, and describe your automated analysis capabilities (Search, Portfolio History, Credit Scoring, Compliance Screening, and Draft Message Generation) using clear executive-level business language."
                 ),
             },
             {MessageField.ROLE.value: MessageRole.USER.value, MessageField.CONTENT.value: sanitized.text},
@@ -139,21 +141,31 @@ class Orchestrator:
 
             if not response.tool_calls:
                 if guard.current == Stage.INIT:
-                    final_text = self._run_full_deterministic_pipeline(guard, tool_context, query)
-                    if (
-                        messages
-                        and messages[-1][MessageField.ROLE.value] == MessageRole.ASSISTANT.value
-                    ):
-                        messages[-1][MessageField.CONTENT.value] = final_text
+                    query_lower = query.lower()
+                    campaign_keywords = [
+                        "find", "search", "get", "target", "filter", "select", "leads", "customer", 
+                        "income", "cibil", "credit", "score", "emi", "kyc", "dnc", "consent", 
+                        "dispute", "loan", "portfolio", "campaign"
+                    ]
+                    if any(kw in query_lower for kw in campaign_keywords):
+                        final_text = self._run_full_deterministic_pipeline(guard, tool_context, query)
+                        if (
+                            messages
+                            and messages[-1][MessageField.ROLE.value] == MessageRole.ASSISTANT.value
+                        ):
+                            messages[-1][MessageField.CONTENT.value] = final_text
+                        else:
+                            messages.append(
+                                {
+                                    MessageField.ROLE.value: MessageRole.ASSISTANT.value,
+                                    MessageField.CONTENT.value: final_text,
+                                }
+                            )
+                        guard.current = Stage.DONE
+                        break
                     else:
-                        messages.append(
-                            {
-                                MessageField.ROLE.value: MessageRole.ASSISTANT.value,
-                                MessageField.CONTENT.value: final_text,
-                            }
-                        )
-                    guard.current = Stage.DONE
-                    break
+                        guard.current = Stage.DONE
+                        break
                 elif guard.current.value >= Stage.COMPLIANCE.value:
                     self._run_deterministic_pipeline(guard, tool_context, collected_ids)
                 break
@@ -531,44 +543,41 @@ class Orchestrator:
             },
         )
 
-        # 8. Build formatted output
+        # Build a highly structured, data-dense GFM Markdown dashboard programmatically to guarantee 100% accuracy and prevent any LLM laziness or truncations.
         output = []
-        output.append("### High-Value Lead Campaign Analysis")
+        output.append("### Premium Campaign Report")
         output.append(
-            "Successfully analyzed your relationship manager portfolio using the requested criteria:"
+            "\nWe are thrilled to present your high-value campaign leads! After carefully reviewing your portfolio "
+            "using the requested target criteria, our multi-stage compliance and analysis engine selected a "
+            "highly qualified group of candidate relationship profiles. These leads possess strong credit ratings, "
+            "manageable debt profiles, and high conversion likelihoods."
         )
-        output.append(f"* **Minimum Income:** ₹{criteria[ToolInputKey.MIN_INCOME.value]/100000:.1f} Lakhs")
-        output.append(f"* **Minimum CIBIL Score:** {criteria[ToolInputKey.MIN_CREDIT_SCORE.value]}")
-        output.append(f"* **Maximum EMI Ratio:** {criteria[ToolInputKey.MAX_EMI_RATIO.value]*100:.1f}%")
         
-        output.append("\n**Campaign Execution Summary:**")
-        output.append(f"* **Total Leads Screened:** {len(customer_ids)}")
-        output.append(f"* **Approved (Compliant):** {len(approved_ids)}")
-        output.append(f"* **Rejected (Non-compliant/DNC):** {len(rejected)}")
+        output.append("\n#### Campaign Execution Summary")
+        output.append(f"* **Total Leads Screened:** **{len(customer_ids)}**")
+        output.append(f"* **Compliant & Approved Leads:** **{len(approved_ids)}**")
+        output.append(f"* **Excluded Leads (Failed Compliance/DNC):** **{len(rejected)}**")
         
-        output.append("\n**Approved Customer Candidates & Metrics:**")
-        for i, c in enumerate(approved_customers, 1):
+        output.append("\n#### Approved Customer Campaign Dashboard")
+        output.append("")
+        output.append("| Candidate Details | Financial Profile | Debt & Score | Actionable Outreach Message Draft |")
+        output.append("| :--- | :--- | :--- | :--- |")
+        
+        for c in approved_customers:
             cid = c[CustomerPayloadKey.ID.value]
             score = scores.get(cid, 75.0)
-            recommendation = recommendations.get(cid, {})
-            output.append(f"\n{i}. **Customer: {c[CustomerPayloadKey.NAME.value]}**")
-            output.append(f"  * **Customer ID:** `{cid}`")
-            output.append(f"  * **Annual Income:** ₹{float(c[CustomerPayloadKey.ANNUAL_INCOME.value]):,.2f}")
-            output.append(f"  * **CIBIL Score:** {c[CustomerPayloadKey.CREDIT_SCORE.value]}")
-            output.append(f"  * **Current EMI Ratio:** {float(c[CustomerPayloadKey.EMI_RATIO.value])*100:.1f}%")
-            output.append(f"  * **Age:** {c[CustomerPayloadKey.AGE.value]} years")
-            output.append(f"  * **KYC Status:** {c[CustomerPayloadKey.KYC_STATUS.value].upper()}")
-            output.append(f"  * **Conversion score:** **{score}** (High conversion likelihood)")
-            output.append(
-                f"  * **Recommended Product:** {recommendation.get('product', 'Personal loan')}"
-            )
-            output.append(
-                f"  * **Reason:** {recommendation.get('reason', 'Meets campaign criteria')}"
-            )
-            output.append(f"  * **Draft Outreach Message:** *\"{messages_dict.get(cid)}\"*")
-
+            rec = recommendations.get(cid, {})
+            msg = messages_dict.get(cid, "")
+            
+            cand_details = f"**{c[CustomerPayloadKey.NAME.value]}**<br><span style='font-size: 10px; color: #64748b;'>Age: {c[CustomerPayloadKey.AGE.value]} · KYC: {c[CustomerPayloadKey.KYC_STATUS.value]}</span>"
+            fin_profile = f"Income: ₹{float(c[CustomerPayloadKey.ANNUAL_INCOME.value])/100000:.1f}L<br>CIBIL: **{c[CustomerPayloadKey.CREDIT_SCORE.value]}**"
+            debt_score = f"EMI: {float(c[CustomerPayloadKey.EMI_RATIO.value])*100:.1f}%<br>Score: **{score:.1f}**"
+            draft_msg = f"**{rec.get('product', 'Personal Loan')}**<br><span style='font-size: 11px; color: #475569;'>*\"{msg}\"*</span>"
+            
+            output.append(f"| {cand_details} | {fin_profile} | {debt_score} | {draft_msg} |")
+            
         if rejected:
-            output.append("\n**Excluded Leads (Failed Compliance/DNC):**")
+            output.append("\n#### Excluded Candidates (Failed Compliance)")
             for i, r in enumerate(rejected, 1):
                 cust = next(
                     (
@@ -581,12 +590,17 @@ class Orchestrator:
                 )
                 name = cust[CustomerPayloadKey.NAME.value] if cust else "Unknown Customer"
                 output.append(
-                    f"{i}. **Customer: {name}** "
-                    f"(ID: `{r[ComplianceFailureKey.CUSTOMER_ID.value]}`) — "
-                    f"*Reason: {r[ComplianceFailureKey.REASON.value]} "
-                    f"(Check: {r[ComplianceFailureKey.CHECK.value]})*"
+                    f"{i}. **{name}** — Rejected: *{r[ComplianceFailureKey.REASON.value]}* (Check: {r[ComplianceFailureKey.CHECK.value]})"
                 )
-                
+        else:
+            output.append("\n#### Excluded Candidates (Failed Compliance)")
+            output.append("No candidates were excluded. 100% of targeted portfolio leads met all compliance and regulatory criteria.")
+
+        output.append(
+            "\n*All message drafts are tailored to each customer's specific profile and compliance consent parameters. "
+            "Please copy the drafts directly to send outreach or discuss next steps with your Relationship Manager team.*"
+        )
+        
         return "\n".join(output)
 
 
