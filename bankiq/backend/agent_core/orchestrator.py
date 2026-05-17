@@ -110,6 +110,9 @@ class Orchestrator:
             ToolInputKey.CAMPAIGN_ID.value: campaign_id,
         }
         collected_ids: list[str] = []
+        approved_ids: list[str] = []
+        scores: dict[str, float] = {}
+        generated_messages: dict[str, str] = {}
 
         for iteration in range(MAX_ITERATIONS):
             if guard.current == Stage.DONE:
@@ -189,6 +192,12 @@ class Orchestrator:
                     ToolName.CHECK_REGULATORY_COMPLIANCE,
                 ):
                     tool_input.setdefault(ToolInputKey.CUSTOMER_IDS.value, collected_ids)
+                if tool_name == ToolName.GENERATE_MESSAGES:
+                    tool_input.setdefault(ToolInputKey.APPROVED_CUSTOMER_IDS.value, approved_ids)
+                    tool_input.setdefault(ToolOutputKey.SCORES.value, scores)
+                if tool_name == ToolName.FINALIZE_RESULTS:
+                    tool_input.setdefault(ToolInputKey.APPROVED_CUSTOMER_IDS.value, approved_ids)
+                    tool_input.setdefault(ToolInputKey.MESSAGES.value, generated_messages)
 
                 result = execute_tool(tool_name, tool_input, guard=guard)
                 result = _truncate(result)
@@ -213,6 +222,21 @@ class Orchestrator:
                         for c in result[ToolOutputKey.CUSTOMERS.value]
                     ]
                     tool_context[ToolInputKey.CUSTOMER_IDS.value] = collected_ids
+                if (
+                    tool_name == ToolName.CALCULATE_CONVERSION_SCORE
+                    and ToolOutputKey.SCORES.value in result
+                ):
+                    scores = result[ToolOutputKey.SCORES.value]
+                if (
+                    tool_name == ToolName.CHECK_REGULATORY_COMPLIANCE
+                    and ToolOutputKey.APPROVED.value in result
+                ):
+                    approved_ids = result[ToolOutputKey.APPROVED.value]
+                if (
+                    tool_name == ToolName.GENERATE_MESSAGES
+                    and ToolInputKey.MESSAGES.value in result
+                ):
+                    generated_messages = result[ToolInputKey.MESSAGES.value]
 
                 messages.append(
                     {
@@ -259,6 +283,7 @@ class Orchestrator:
             ),
         ]
         approved: list[str] = []
+        scores: dict[str, float] = {}
         for name, inputs in steps:
             result = execute_tool(name, inputs, guard=guard)
             self._emit_stage(
@@ -266,14 +291,33 @@ class Orchestrator:
                 PipelineEventStatus.COMPLETED,
                 {ToolOutputKey.TOOL.value: name.value, ToolOutputKey.FALLBACK.value: True},
             )
+            if name == ToolName.CALCULATE_CONVERSION_SCORE:
+                scores = result.get(ToolOutputKey.SCORES.value, {})
             if name == ToolName.CHECK_REGULATORY_COMPLIANCE:
                 approved = result.get(ToolOutputKey.APPROVED.value, [])
 
         if approved and Stage.COMPLIANCE in guard.visited:
+            message_result = execute_tool(
+                ToolName.GENERATE_MESSAGES,
+                {
+                    **ctx,
+                    ToolInputKey.APPROVED_CUSTOMER_IDS.value: approved,
+                    ToolOutputKey.SCORES.value: scores,
+                },
+                guard=guard,
+            )
+            self._emit_stage(
+                guard.current.name,
+                PipelineEventStatus.COMPLETED,
+                {
+                    ToolOutputKey.TOOL.value: ToolName.GENERATE_MESSAGES.value,
+                    ToolOutputKey.FALLBACK.value: True,
+                },
+            )
             finalize_inputs = {
                 **ctx,
                 ToolInputKey.APPROVED_CUSTOMER_IDS.value: approved,
-                ToolInputKey.MESSAGES.value: {},
+                ToolInputKey.MESSAGES.value: message_result.get(ToolInputKey.MESSAGES.value, {}),
             }
             execute_tool(ToolName.FINALIZE_RESULTS, finalize_inputs, guard=guard)
             self._emit_stage(
@@ -449,16 +493,17 @@ class Orchestrator:
         # 6. Generate messages
         self._emit_stage(Stage.GENERATE_MESSAGES.name, PipelineEventStatus.STARTED, {})
         approved_customers = [c for c in customers if c[CustomerPayloadKey.ID.value] in approved_ids]
-        messages_dict = {}
-        for c in approved_customers:
-            cid = c[CustomerPayloadKey.ID.value]
-            name = c[CustomerPayloadKey.NAME.value]
-            score = scores.get(cid, 75.0)
-            messages_dict[cid] = (
-                f"Dear {name}, we appreciate your banking relationship with BankIQ. "
-                f"We are pleased to offer you a personalized pre-approved personal loan option "
-                f"tailored to your financial profile. Standard terms apply."
-            )
+        message_result = execute_tool(
+            ToolName.GENERATE_MESSAGES,
+            {
+                **ctx,
+                ToolInputKey.APPROVED_CUSTOMER_IDS.value: approved_ids,
+                ToolOutputKey.SCORES.value: scores,
+            },
+            guard=guard,
+        )
+        messages_dict = message_result.get(ToolInputKey.MESSAGES.value, {})
+        recommendations = message_result.get("recommendations", {})
         self._emit_stage(
             Stage.GENERATE_MESSAGES.name,
             PipelineEventStatus.COMPLETED,
@@ -505,6 +550,7 @@ class Orchestrator:
         for i, c in enumerate(approved_customers, 1):
             cid = c[CustomerPayloadKey.ID.value]
             score = scores.get(cid, 75.0)
+            recommendation = recommendations.get(cid, {})
             output.append(f"\n{i}. **Customer: {c[CustomerPayloadKey.NAME.value]}**")
             output.append(f"  * **Customer ID:** `{cid}`")
             output.append(f"  * **Annual Income:** ₹{float(c[CustomerPayloadKey.ANNUAL_INCOME.value]):,.2f}")
@@ -513,6 +559,12 @@ class Orchestrator:
             output.append(f"  * **Age:** {c[CustomerPayloadKey.AGE.value]} years")
             output.append(f"  * **KYC Status:** {c[CustomerPayloadKey.KYC_STATUS.value].upper()}")
             output.append(f"  * **Conversion score:** **{score}** (High conversion likelihood)")
+            output.append(
+                f"  * **Recommended Product:** {recommendation.get('product', 'Personal loan')}"
+            )
+            output.append(
+                f"  * **Reason:** {recommendation.get('reason', 'Meets campaign criteria')}"
+            )
             output.append(f"  * **Draft Outreach Message:** *\"{messages_dict.get(cid)}\"*")
 
         if rejected:

@@ -228,6 +228,80 @@ def check_regulatory_compliance(inputs: dict) -> dict:
     return {ToolOutputKey.APPROVED.value: approved, ToolOutputKey.REJECTED.value: rejected}
 
 
+def _loan_product_for(customer: Any, score: float) -> dict[str, str]:
+    """Choose a personal-loan offer variant from customer profile signals."""
+    emi_ratio = float(customer.emi_ratio)
+    income = float(customer.annual_income)
+    balance = float(customer.savings_balance)
+
+    if score >= 82 and customer.credit_score >= 760 and emi_ratio <= 0.25:
+        return {
+            "product": "Premium pre-approved personal loan",
+            "reason": "strong credit profile, low EMI burden, and high conversion score",
+        }
+    if balance >= 1_000_000 and income >= 1_200_000:
+        return {
+            "product": "High-value personal loan with priority processing",
+            "reason": "healthy savings balance and high annual income",
+        }
+    if emi_ratio <= 0.35:
+        return {
+            "product": "Pre-approved personal loan",
+            "reason": "manageable EMI ratio and eligible income profile",
+        }
+    return {
+        "product": "Personal loan eligibility discussion",
+        "reason": "eligible profile after compliance checks",
+    }
+
+
+def generate_messages(inputs: dict) -> dict:
+    """
+    Generate product recommendations and personalized WhatsApp messages.
+
+    Parameters:
+        inputs: Dict with approved_customer_ids, optional scores, and optional rm_id.
+
+    Returns:
+        Dict with messages and recommendations keyed by customer_id.
+    """
+    from apps.customers.models import Customer
+
+    approved_ids: list[str] = inputs.get(ToolInputKey.APPROVED_CUSTOMER_IDS.value) or inputs.get(
+        ToolInputKey.CUSTOMER_IDS.value,
+        [],
+    )
+    rm_id = inputs.get(ToolInputKey.RM_ID.value)
+    raw_scores: dict[str, Any] = inputs.get(ToolOutputKey.SCORES.value, {})
+    messages: dict[str, str] = {}
+    recommendations: dict[str, dict[str, str | float]] = {}
+
+    for chunk in _chunk(approved_ids):
+        qs = Customer.objects.filter(id__in=chunk)
+        if rm_id:
+            qs = qs.filter(rm_id=rm_id)
+        for customer in qs.iterator(chunk_size=500):
+            cid = str(customer.id)
+            score = float(raw_scores.get(cid, 75.0))
+            offer = _loan_product_for(customer, score)
+            income_lakh = float(customer.annual_income) / 100_000
+            emi_percent = float(customer.emi_ratio) * 100
+            messages[cid] = (
+                f"Hi {customer.name}, based on your banking relationship with BankIQ, "
+                f"annual income of about ₹{income_lakh:.1f} lakh, CIBIL score of "
+                f"{customer.credit_score}, and current EMI ratio near {emi_percent:.1f}%, "
+                f"you may be eligible for our {offer['product']}. Reply YES and your "
+                "Relationship Manager will share the next steps. Standard terms apply."
+            )
+            recommendations[cid] = {
+                "product": offer["product"],
+                "reason": offer["reason"],
+                "conversion_score": score,
+            }
+
+    return {ToolInputKey.MESSAGES.value: messages, "recommendations": recommendations}
+
+
 def finalize_results(inputs: dict) -> dict:
     """
     Finalize campaign results after compliance and message generation.
@@ -314,5 +388,6 @@ TOOL_REGISTRY: dict[ToolName, Callable[[dict], dict]] = {
     ToolName.GET_TRANSACTION_HISTORY: get_transaction_history,
     ToolName.CALCULATE_CONVERSION_SCORE: calculate_conversion_score,
     ToolName.CHECK_REGULATORY_COMPLIANCE: check_regulatory_compliance,
+    ToolName.GENERATE_MESSAGES: generate_messages,
     ToolName.FINALIZE_RESULTS: finalize_results,
 }

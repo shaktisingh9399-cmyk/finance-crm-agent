@@ -319,16 +319,50 @@ Compliance is mandatory. `finalize_results` is rejected until the compliance sta
 
 Current registered tools:
 
-| Tool | Stage |
-| --- | --- |
-| `search_customers` | `SEARCH` |
-| `get_transaction_history` | `FETCH_HISTORY` |
-| `calculate_conversion_score` | `SCORE` |
-| `check_regulatory_compliance` | `COMPLIANCE` |
-| `generate_messages` | `GENERATE_MESSAGES` |
-| `finalize_results` | `FINALIZE` |
+| Tool | Stage | Input | Output | Why it exists |
+| --- | --- | --- | --- | --- |
+| `search_customers` | `SEARCH` | RM id, income, credit score, EMI filters | Masked candidate customers | Converts natural-language targeting into structured portfolio search |
+| `get_transaction_history` | `FETCH_HISTORY` | Customer ids | Monthly debit, credit, and balance summaries | Adds behavior context beyond static profile data |
+| `calculate_conversion_score` | `SCORE` | Customer ids | Score per customer | Ranks leads using transparent heuristics |
+| `check_regulatory_compliance` | `COMPLIANCE` | Customer ids | Approved and rejected customers with reasons | Prevents unsafe outreach before message generation |
+| `generate_messages` | `GENERATE_MESSAGES` | Approved ids and scores | Product recommendations and WhatsApp drafts | Produces personalized outreach from customer attributes |
+| `finalize_results` | `FINALIZE` | Approved ids and messages | Summary counts and campaign records | Persists campaign output when a campaign id is provided |
 
 Compliance checks currently include DNC registry, active dispute, KYC completion, minimum age, and consent flag.
+
+## Execution Flow
+
+1. The RM logs in and receives JWT access and refresh tokens.
+2. The frontend creates a `session_id`, opens a WebSocket, and posts the RM query to `/api/v1/agent/query/`.
+3. Django authenticates the RM, validates the query, rate-limits the request, and enqueues a Celery task.
+4. Celery runs the agent orchestrator outside the HTTP request cycle.
+5. The orchestrator sanitizes input, chooses an LLM provider, and executes only registered tools.
+6. `PipelineGuard` enforces strict stage order, including mandatory compliance before messages or final output.
+7. Tools read structured data from PostgreSQL, mask PII, score leads, reject non-compliant leads, and generate personalized outreach.
+8. Celery publishes stage updates through Django Channels and Redis.
+9. The frontend displays live progress and the final campaign summary.
+
+## Key Design Decisions
+
+| Decision | Reason |
+| --- | --- |
+| Celery for orchestration execution | Avoids HTTP timeouts and keeps the UI responsive |
+| Redis for broker and realtime channel layer | One lightweight service supports background jobs and WebSocket fanout |
+| PostgreSQL as source of truth | CRM data is relational and benefits from indexed structured queries |
+| Deterministic fallback path | Demo still works if an LLM provider fails or returns no tool calls |
+| PII masking in tools | Sensitive banking fields are protected before results reach the agent response |
+
+## Trade-offs and Limitations
+
+| Choice | Benefit | Trade-off |
+| --- | --- | --- |
+| Strict ordered pipeline | Safer and easier to audit | Less flexible than a fully autonomous agent |
+| Rule-based score | Transparent for evaluators | Less accurate than a trained ML model |
+| Rule-based compliance | Deterministic and explainable | Needs maintenance as policy changes |
+| Celery + Redis | Reliable async execution | More infrastructure than a single-process app |
+| WebSockets | Real-time UX | More operational complexity than polling |
+| Aggressive PII masking | Safer banking default | Some details are hidden from the UI |
+| Multiple LLM providers | Better resilience | Provider outputs may differ |
 
 ## Data and Compliance Model
 
@@ -427,11 +461,11 @@ Find high-value customers likely to convert for a personal loan this month and g
 ```
 
 ```text
-Identify low-engagement customers with strong savings for a fixed deposit campaign.
+Find customers with income above 15 lakh, CIBIL score above 760, and EMI below 25 percent for a premium personal loan offer.
 ```
 
 ```text
-Find customers who recently closed a loan and are prime candidates for a fresh personal loan.
+Find eligible personal loan leads but exclude anyone without consent, incomplete KYC, active disputes, or Do Not Contact status.
 ```
 
-
+Video walkthrough script: [docs/demo-video-script.md](./docs/demo-video-script.md)

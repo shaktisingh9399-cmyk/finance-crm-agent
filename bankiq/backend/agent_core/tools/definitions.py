@@ -73,6 +73,35 @@ TOOL_DEFINITIONS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": ToolName.GENERATE_MESSAGES.value,
+            "description": (
+                "Recommend a suitable banking product and generate personalized "
+                "WhatsApp outreach for compliance-approved customers."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    ToolInputKey.APPROVED_CUSTOMER_IDS.value: {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    ToolInputKey.CUSTOMER_IDS.value: {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "scores": {
+                        "type": "object",
+                        "description": "Optional precomputed scores keyed by customer ID.",
+                        "additionalProperties": {"type": "number"},
+                    },
+                },
+                "required": [ToolInputKey.APPROVED_CUSTOMER_IDS.value],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": ToolName.FINALIZE_RESULTS.value,
             "description": "Finalize approved candidates and messages for the campaign.",
             "parameters": {
