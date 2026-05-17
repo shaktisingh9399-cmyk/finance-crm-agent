@@ -1,0 +1,552 @@
+"""Main agentic loop — stateless, PipelineGuard-enforced, LLM-driven tool execution."""
+
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
+
+from agent_core.enums import (
+    ComplianceFailureKey,
+    CustomerPayloadKey,
+    MessageField,
+    MessageRole,
+    PipelineEventStatus,
+    ToolCallField,
+    ToolInputKey,
+    ToolName,
+    ToolOutputKey,
+)
+from agent_core.input_sanitizer import InputSanitizer
+from agent_core.llm_selector import LLMSelector
+from agent_core.pipeline_guard import PipelineGuard, Stage
+from agent_core.tools.definitions import TOOL_DEFINITIONS
+from agent_core.tools.executor import execute_tool
+
+logger = logging.getLogger(__name__)
+
+MAX_ITERATIONS = 20
+MAX_TOOL_RESULT_CHARS = 12_000
+
+_sanitizer = InputSanitizer()
+
+
+@dataclass
+class OrchestratorResult:
+    """Structured result returned by orchestrator.run()."""
+
+    success: bool
+    messages: list[dict[str, Any]]
+    final_stage: str
+    provider: str = ""
+    error: Optional[str] = None
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+def _truncate(result: dict) -> dict:
+    serialized = json.dumps(result)
+    if len(serialized) <= MAX_TOOL_RESULT_CHARS:
+        return result
+    return {
+        ToolOutputKey.TRUNCATED.value: True,
+        ToolOutputKey.PREVIEW.value: serialized[:MAX_TOOL_RESULT_CHARS] + " [TRUNCATED]",
+    }
+
+
+class Orchestrator:
+    """Runs the agent pipeline loop for a single RM query."""
+
+    def __init__(
+        self,
+        llm_selector: Optional[LLMSelector] = None,
+        stage_callback: Optional[Callable[[str, str, dict], None]] = None,
+    ) -> None:
+        self._llm = llm_selector or LLMSelector()
+        self._stage_callback = stage_callback
+
+    def run(
+        self,
+        query: str,
+        rm_id: str,
+        campaign_id: Optional[str] = None,
+    ) -> OrchestratorResult:
+        """
+        Execute the agent pipeline for an RM query.
+
+        Parameters:
+            query: Raw RM natural-language query.
+            rm_id: UUID string of the authenticated RM.
+            campaign_id: Optional campaign UUID for finalize_results.
+
+        Returns:
+            OrchestratorResult with pipeline outcome.
+        """
+        sanitized = _sanitizer.sanitize(query)
+        if not sanitized.ok:
+            return OrchestratorResult(
+                success=False,
+                messages=[],
+                final_stage=Stage.INIT.name,
+                error=sanitized.error,
+            )
+
+        guard = PipelineGuard()
+        messages: list[dict[str, Any]] = [
+            {
+                MessageField.ROLE.value: MessageRole.SYSTEM.value,
+                MessageField.CONTENT.value: (
+                    "You are BankIQ, an AI assistant for bank relationship managers. "
+                    "Use tools in strict order: search_customers → get_transaction_history "
+                    "→ calculate_conversion_score → check_regulatory_compliance → "
+                    "generate messages → finalize_results. Never skip compliance."
+                ),
+            },
+            {MessageField.ROLE.value: MessageRole.USER.value, MessageField.CONTENT.value: sanitized.text},
+        ]
+
+        self._emit_stage(Stage.INIT.name, PipelineEventStatus.STARTED, {})
+        provider = ""
+        tool_context: dict[str, Any] = {
+            ToolInputKey.RM_ID.value: rm_id,
+            ToolInputKey.CAMPAIGN_ID.value: campaign_id,
+        }
+        collected_ids: list[str] = []
+
+        for iteration in range(MAX_ITERATIONS):
+            if guard.current == Stage.DONE:
+                break
+
+            try:
+                response = self._llm.complete_with_failover(messages, TOOL_DEFINITIONS)
+                provider = response.provider
+            except RuntimeError as exc:
+                return OrchestratorResult(
+                    success=False,
+                    messages=messages,
+                    final_stage=guard.current.name,
+                    error=str(exc),
+                )
+
+            if response.content:
+                messages.append(
+                    {
+                        MessageField.ROLE.value: MessageRole.ASSISTANT.value,
+                        MessageField.CONTENT.value: response.content,
+                    }
+                )
+
+            if not response.tool_calls:
+                if guard.current == Stage.INIT:
+                    final_text = self._run_full_deterministic_pipeline(guard, tool_context, query)
+                    if (
+                        messages
+                        and messages[-1][MessageField.ROLE.value] == MessageRole.ASSISTANT.value
+                    ):
+                        messages[-1][MessageField.CONTENT.value] = final_text
+                    else:
+                        messages.append(
+                            {
+                                MessageField.ROLE.value: MessageRole.ASSISTANT.value,
+                                MessageField.CONTENT.value: final_text,
+                            }
+                        )
+                    guard.current = Stage.DONE
+                    break
+                elif guard.current.value >= Stage.COMPLIANCE.value:
+                    self._run_deterministic_pipeline(guard, tool_context, collected_ids)
+                break
+
+            for tc in response.tool_calls:
+                raw_tool_name = tc[ToolCallField.NAME.value]
+                try:
+                    tool_name = ToolName(raw_tool_name)
+                except ValueError:
+                    messages.append(
+                        {
+                            MessageField.ROLE.value: MessageRole.TOOL.value,
+                            MessageField.TOOL_CALL_ID.value: tc.get(
+                                ToolCallField.ID.value,
+                                raw_tool_name,
+                            ),
+                            MessageField.NAME.value: raw_tool_name,
+                            MessageField.CONTENT.value: json.dumps(
+                                {ToolOutputKey.ERROR.value: f"Unknown tool: {raw_tool_name}"}
+                            ),
+                        }
+                    )
+                    continue
+                try:
+                    tool_input = json.loads(tc.get(ToolCallField.ARGUMENTS.value, "{}"))
+                except json.JSONDecodeError:
+                    tool_input = {}
+                tool_input.setdefault(ToolInputKey.RM_ID.value, rm_id)
+                if campaign_id:
+                    tool_input.setdefault(ToolInputKey.CAMPAIGN_ID.value, campaign_id)
+
+                if tool_name == ToolName.GET_TRANSACTION_HISTORY and collected_ids:
+                    tool_input.setdefault(ToolInputKey.CUSTOMER_IDS.value, collected_ids)
+                if tool_name in (
+                    ToolName.CALCULATE_CONVERSION_SCORE,
+                    ToolName.CHECK_REGULATORY_COMPLIANCE,
+                ):
+                    tool_input.setdefault(ToolInputKey.CUSTOMER_IDS.value, collected_ids)
+
+                result = execute_tool(tool_name, tool_input, guard=guard)
+                result = _truncate(result)
+                logger.info(
+                    "Tool result tool=%s stage=%s iteration=%d",
+                    tool_name.value,
+                    guard.current.name,
+                    iteration,
+                )
+                self._emit_stage(
+                    guard.current.name,
+                    PipelineEventStatus.COMPLETED,
+                    {ToolOutputKey.TOOL.value: tool_name.value},
+                )
+
+                if (
+                    tool_name == ToolName.SEARCH_CUSTOMERS
+                    and ToolOutputKey.CUSTOMERS.value in result
+                ):
+                    collected_ids = [
+                        c[CustomerPayloadKey.ID.value]
+                        for c in result[ToolOutputKey.CUSTOMERS.value]
+                    ]
+                    tool_context[ToolInputKey.CUSTOMER_IDS.value] = collected_ids
+
+                messages.append(
+                    {
+                        MessageField.ROLE.value: MessageRole.TOOL.value,
+                        MessageField.TOOL_CALL_ID.value: tc.get(
+                            ToolCallField.ID.value,
+                            tool_name.value,
+                        ),
+                        MessageField.NAME.value: tool_name.value,
+                        MessageField.CONTENT.value: json.dumps(result),
+                    }
+                )
+
+        self._emit_stage(Stage.DONE.name, PipelineEventStatus.COMPLETED, {})
+        if guard.current == Stage.FINALIZE:
+            guard.advance(Stage.DONE)
+
+        return OrchestratorResult(
+            success=True,
+            messages=messages,
+            final_stage=guard.current.name,
+            provider=provider,
+            data={ToolInputKey.CUSTOMER_IDS.value: collected_ids},
+        )
+
+    def _run_deterministic_pipeline(
+        self,
+        guard: PipelineGuard,
+        ctx: dict[str, Any],
+        customer_ids: list[str],
+    ) -> None:
+        """Fallback deterministic tool chain when LLM returns no tool calls."""
+        if not customer_ids:
+            return
+        steps = [
+            (ToolName.GET_TRANSACTION_HISTORY, {ToolInputKey.CUSTOMER_IDS.value: customer_ids, **ctx}),
+            (
+                ToolName.CALCULATE_CONVERSION_SCORE,
+                {ToolInputKey.CUSTOMER_IDS.value: customer_ids, **ctx},
+            ),
+            (
+                ToolName.CHECK_REGULATORY_COMPLIANCE,
+                {ToolInputKey.CUSTOMER_IDS.value: customer_ids, **ctx},
+            ),
+        ]
+        approved: list[str] = []
+        for name, inputs in steps:
+            result = execute_tool(name, inputs, guard=guard)
+            self._emit_stage(
+                guard.current.name,
+                PipelineEventStatus.COMPLETED,
+                {ToolOutputKey.TOOL.value: name.value, ToolOutputKey.FALLBACK.value: True},
+            )
+            if name == ToolName.CHECK_REGULATORY_COMPLIANCE:
+                approved = result.get(ToolOutputKey.APPROVED.value, [])
+
+        if approved and Stage.COMPLIANCE in guard.visited:
+            finalize_inputs = {
+                **ctx,
+                ToolInputKey.APPROVED_CUSTOMER_IDS.value: approved,
+                ToolInputKey.MESSAGES.value: {},
+            }
+            execute_tool(ToolName.FINALIZE_RESULTS, finalize_inputs, guard=guard)
+            self._emit_stage(
+                guard.current.name,
+                PipelineEventStatus.COMPLETED,
+                {ToolOutputKey.TOOL.value: ToolName.FINALIZE_RESULTS.value},
+            )
+
+    def _emit_stage(self, stage: str, status: PipelineEventStatus | str, data: dict) -> None:
+        if self._stage_callback:
+            event_status = status.value if isinstance(status, PipelineEventStatus) else status
+            self._stage_callback(stage, event_status, data)
+
+    def _parse_search_criteria(self, query: str) -> dict[str, Any]:
+        criteria = {
+            ToolInputKey.MIN_INCOME.value: 1200000.0,
+            ToolInputKey.MIN_CREDIT_SCORE.value: 720,
+            ToolInputKey.MAX_EMI_RATIO.value: 0.35,
+        }
+        
+        import re
+        
+        # Match income (e.g. "12 lakh", "12 lakhs", "1200000", "12,000,000", "15 lakhs")
+        income_match = re.search(
+            r'(?:income\s+(?:above|>=|>)\s*(?:₹|rs\.?)?\s*(\d+(?:\.\d+)?)\s*(?:lakh|lakhs|l)?|min(?:imum)?\s+income\s+of\s*(?:₹|rs\.?)?\s*(\d+(?:\.\d+)?)\s*(?:lakh|lakhs|l)?)',
+            query,
+            re.IGNORECASE,
+        )
+        if income_match:
+            val = income_match.group(1) or income_match.group(2)
+            try:
+                criteria[ToolInputKey.MIN_INCOME.value] = float(val) * 100_000.0
+            except ValueError:
+                pass
+        else:
+            # Check raw digits like "1200000" or "1,200,000"
+            digits_match = re.search(
+                r'income\s+(?:above|>=|>)\s*(?:₹|rs\.?)?\s*(\d{2,3}(?:,\d{2,3})*(?:,\d{3})*)',
+                query,
+                re.IGNORECASE,
+            )
+            if digits_match:
+                try:
+                    criteria[ToolInputKey.MIN_INCOME.value] = float(
+                        digits_match.group(1).replace(",", "")
+                    )
+                except ValueError:
+                    pass
+
+        # Match CIBIL/credit score (e.g. "cibil score of 720+", "720 or higher", "cibil >= 720")
+        credit_match = re.search(
+            r'(?:cibil|credit|score).*?(\d{3})',
+            query,
+            re.IGNORECASE,
+        )
+        if credit_match:
+            try:
+                criteria[ToolInputKey.MIN_CREDIT_SCORE.value] = int(credit_match.group(1))
+            except ValueError:
+                pass
+
+        # Match EMI ratio (e.g. "emi below 35%", "emi below 0.35", etc.)
+        emi_match = re.search(
+            r'(?:emi|debt|installment).*?(\d{2}(?:\.\d+)?)\s*%',
+            query,
+            re.IGNORECASE,
+        )
+        if emi_match:
+            try:
+                criteria[ToolInputKey.MAX_EMI_RATIO.value] = float(emi_match.group(1)) / 100.0
+            except ValueError:
+                pass
+        else:
+            emi_decimal = re.search(
+                r'(?:emi|debt|installment).*?(?:below|<=|<)\s*(0\.\d+)',
+                query,
+                re.IGNORECASE,
+            )
+            if emi_decimal:
+                try:
+                    criteria[ToolInputKey.MAX_EMI_RATIO.value] = float(emi_decimal.group(1))
+                except ValueError:
+                    pass
+
+        return criteria
+
+    def _run_full_deterministic_pipeline(
+        self,
+        guard: PipelineGuard,
+        ctx: dict[str, Any],
+        query: str,
+    ) -> str:
+        """Run the full tool chain deterministically starting from search_customers."""
+        # 1. Parse search criteria from the query
+        criteria = self._parse_search_criteria(query)
+        criteria[ToolInputKey.RM_ID.value] = ctx[ToolInputKey.RM_ID.value]
+
+        # 2. Search customers
+        self._emit_stage(Stage.SEARCH.name, PipelineEventStatus.STARTED, {})
+        search_result = execute_tool(ToolName.SEARCH_CUSTOMERS, criteria, guard=guard)
+        customers = search_result.get(ToolOutputKey.CUSTOMERS.value, [])
+        self._emit_stage(
+            Stage.SEARCH.name,
+            PipelineEventStatus.COMPLETED,
+            {
+                ToolOutputKey.TOOL.value: ToolName.SEARCH_CUSTOMERS.value,
+                ToolOutputKey.FALLBACK.value: True,
+            },
+        )
+
+        if not customers:
+            return (
+                "**No eligible customers found**\n\n"
+                "I searched your portfolio but found no customers matching these criteria:\n"
+                f"* Minimum Income: ₹{criteria[ToolInputKey.MIN_INCOME.value]/100000:.1f} Lakhs\n"
+                f"* Minimum CIBIL Score: {criteria[ToolInputKey.MIN_CREDIT_SCORE.value]}\n"
+                f"* Maximum EMI Ratio: {criteria[ToolInputKey.MAX_EMI_RATIO.value]*100:.1f}%\n"
+            )
+
+        customer_ids = [c[CustomerPayloadKey.ID.value] for c in customers]
+
+        # 3. Get transaction history
+        self._emit_stage(Stage.FETCH_HISTORY.name, PipelineEventStatus.STARTED, {})
+        execute_tool(
+            ToolName.GET_TRANSACTION_HISTORY,
+            {ToolInputKey.CUSTOMER_IDS.value: customer_ids, **ctx},
+            guard=guard,
+        )
+        self._emit_stage(
+            Stage.FETCH_HISTORY.name,
+            PipelineEventStatus.COMPLETED,
+            {
+                ToolOutputKey.TOOL.value: ToolName.GET_TRANSACTION_HISTORY.value,
+                ToolOutputKey.FALLBACK.value: True,
+            },
+        )
+
+        # 4. Calculate conversion score
+        self._emit_stage(Stage.SCORE.name, PipelineEventStatus.STARTED, {})
+        scores_result = execute_tool(
+            ToolName.CALCULATE_CONVERSION_SCORE,
+            {ToolInputKey.CUSTOMER_IDS.value: customer_ids, **ctx},
+            guard=guard,
+        )
+        scores = scores_result.get(ToolOutputKey.SCORES.value, {})
+        self._emit_stage(
+            Stage.SCORE.name,
+            PipelineEventStatus.COMPLETED,
+            {
+                ToolOutputKey.TOOL.value: ToolName.CALCULATE_CONVERSION_SCORE.value,
+                ToolOutputKey.FALLBACK.value: True,
+            },
+        )
+
+        # 5. Check regulatory compliance
+        self._emit_stage(Stage.COMPLIANCE.name, PipelineEventStatus.STARTED, {})
+        compliance_result = execute_tool(
+            ToolName.CHECK_REGULATORY_COMPLIANCE,
+            {ToolInputKey.CUSTOMER_IDS.value: customer_ids, **ctx},
+            guard=guard,
+        )
+        approved_ids = compliance_result.get(ToolOutputKey.APPROVED.value, [])
+        rejected = compliance_result.get(ToolOutputKey.REJECTED.value, [])
+        self._emit_stage(
+            Stage.COMPLIANCE.name,
+            PipelineEventStatus.COMPLETED,
+            {
+                ToolOutputKey.TOOL.value: ToolName.CHECK_REGULATORY_COMPLIANCE.value,
+                ToolOutputKey.FALLBACK.value: True,
+            },
+        )
+
+        # 6. Generate messages
+        self._emit_stage(Stage.GENERATE_MESSAGES.name, PipelineEventStatus.STARTED, {})
+        approved_customers = [c for c in customers if c[CustomerPayloadKey.ID.value] in approved_ids]
+        messages_dict = {}
+        for c in approved_customers:
+            cid = c[CustomerPayloadKey.ID.value]
+            name = c[CustomerPayloadKey.NAME.value]
+            score = scores.get(cid, 75.0)
+            messages_dict[cid] = (
+                f"Dear {name}, we appreciate your banking relationship with BankIQ. "
+                f"We are pleased to offer you a personalized pre-approved personal loan option "
+                f"tailored to your financial profile. Standard terms apply."
+            )
+        self._emit_stage(
+            Stage.GENERATE_MESSAGES.name,
+            PipelineEventStatus.COMPLETED,
+            {
+                ToolOutputKey.TOOL.value: ToolName.GENERATE_MESSAGES.value,
+                ToolOutputKey.FALLBACK.value: True,
+            },
+        )
+
+        # 7. Finalize results
+        self._emit_stage(Stage.FINALIZE.name, PipelineEventStatus.STARTED, {})
+        finalize_inputs = {
+            **ctx,
+            ToolInputKey.APPROVED_CUSTOMER_IDS.value: approved_ids,
+            ToolInputKey.MESSAGES.value: messages_dict,
+            ToolInputKey.REJECTED_COUNT.value: len(rejected),
+        }
+        execute_tool(ToolName.FINALIZE_RESULTS, finalize_inputs, guard=guard)
+        self._emit_stage(
+            Stage.FINALIZE.name,
+            PipelineEventStatus.COMPLETED,
+            {
+                ToolOutputKey.TOOL.value: ToolName.FINALIZE_RESULTS.value,
+                ToolOutputKey.FALLBACK.value: True,
+            },
+        )
+
+        # 8. Build formatted output
+        output = []
+        output.append("### High-Value Lead Campaign Analysis")
+        output.append(
+            "Successfully analyzed your relationship manager portfolio using the requested criteria:"
+        )
+        output.append(f"* **Minimum Income:** ₹{criteria[ToolInputKey.MIN_INCOME.value]/100000:.1f} Lakhs")
+        output.append(f"* **Minimum CIBIL Score:** {criteria[ToolInputKey.MIN_CREDIT_SCORE.value]}")
+        output.append(f"* **Maximum EMI Ratio:** {criteria[ToolInputKey.MAX_EMI_RATIO.value]*100:.1f}%")
+        
+        output.append("\n**Campaign Execution Summary:**")
+        output.append(f"* **Total Leads Screened:** {len(customer_ids)}")
+        output.append(f"* **Approved (Compliant):** {len(approved_ids)}")
+        output.append(f"* **Rejected (Non-compliant/DNC):** {len(rejected)}")
+        
+        output.append("\n**Approved Customer Candidates & Metrics:**")
+        for i, c in enumerate(approved_customers, 1):
+            cid = c[CustomerPayloadKey.ID.value]
+            score = scores.get(cid, 75.0)
+            output.append(f"\n{i}. **Customer: {c[CustomerPayloadKey.NAME.value]}**")
+            output.append(f"  * **Customer ID:** `{cid}`")
+            output.append(f"  * **Annual Income:** ₹{float(c[CustomerPayloadKey.ANNUAL_INCOME.value]):,.2f}")
+            output.append(f"  * **CIBIL Score:** {c[CustomerPayloadKey.CREDIT_SCORE.value]}")
+            output.append(f"  * **Current EMI Ratio:** {float(c[CustomerPayloadKey.EMI_RATIO.value])*100:.1f}%")
+            output.append(f"  * **Age:** {c[CustomerPayloadKey.AGE.value]} years")
+            output.append(f"  * **KYC Status:** {c[CustomerPayloadKey.KYC_STATUS.value].upper()}")
+            output.append(f"  * **Conversion score:** **{score}** (High conversion likelihood)")
+            output.append(f"  * **Draft Outreach Message:** *\"{messages_dict.get(cid)}\"*")
+
+        if rejected:
+            output.append("\n**Excluded Leads (Failed Compliance/DNC):**")
+            for i, r in enumerate(rejected, 1):
+                cust = next(
+                    (
+                        c
+                        for c in customers
+                        if c[CustomerPayloadKey.ID.value]
+                        == r[ComplianceFailureKey.CUSTOMER_ID.value]
+                    ),
+                    None,
+                )
+                name = cust[CustomerPayloadKey.NAME.value] if cust else "Unknown Customer"
+                output.append(
+                    f"{i}. **Customer: {name}** "
+                    f"(ID: `{r[ComplianceFailureKey.CUSTOMER_ID.value]}`) — "
+                    f"*Reason: {r[ComplianceFailureKey.REASON.value]} "
+                    f"(Check: {r[ComplianceFailureKey.CHECK.value]})*"
+                )
+                
+        return "\n".join(output)
+
+
+def run(
+    query: str,
+    rm_id: str,
+    campaign_id: Optional[str] = None,
+    stage_callback: Optional[Callable[[str, str, dict], None]] = None,
+) -> OrchestratorResult:
+    """Module-level entry point for the agent pipeline."""
+    return Orchestrator(stage_callback=stage_callback).run(
+        query=query,
+        rm_id=rm_id,
+        campaign_id=campaign_id,
+    )
